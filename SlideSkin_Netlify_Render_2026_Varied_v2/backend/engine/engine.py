@@ -10,9 +10,9 @@ from base_engine import (source_content, clone_template_slide, set_text,
                          get_title, get_bodies, EMU)
 
 COVER=8
-CLOSING=28
-TEXT_LAYOUTS=[9,10,11,14,15,21,22,23]
-IMAGE_LAYOUTS=[12,16,17,18]
+CLOSING=18
+TEXT_LAYOUTS=[9,11,12,14,17]
+IMAGE_LAYOUTS=[9,11,12,14]
 
 def is_intro(c):
     t=c['title'].lower().strip()
@@ -23,24 +23,23 @@ def is_closing(c):
     return bool(re.search(r'^(thank you|thanks|questions|q\s*&\s*a|the end|closing)(\b|$)',t))
 
 def choose_layout(c,previous,usage,slide_num):
+    """Rank real 19-slide template candidates, penalizing repetition."""
     imgs=len(c['images']); n=len(c['bullets']); chars=sum(map(len,c['bullets']))
     candidates=IMAGE_LAYOUTS if imgs else TEXT_LAYOUTS
     scores=[]
     for idx in candidates:
         score=0.0
         if imgs:
-            score += {12:4,16:3,17:5,18:5}[idx]
-            if n>=4: score += {12:1,16:1,17:3,18:3}[idx]
-            if chars>500:score += {12:2,16:2,17:-3,18:-3}[idx]
+            score += {9:5,11:2,12:4,14:3}[idx]
+            if chars>450: score += {9:-3,11:2,12:0,14:1}[idx]
         else:
-            if n>=5:score += {9:3,10:4,11:3,14:4,15:3,21:0,22:0,23:0}[idx]
-            elif n>=3:score += {9:3,10:3,11:3,14:3,15:4,21:4,22:4,23:3}[idx]
-            else:score += {9:4,10:2,11:3,14:4,15:2,21:3,22:3,23:3}[idx]
-            if chars>650:score += 2 if idx in (9,10,14) else -3
-        score-=usage.get(idx,0)*1.25
-        if idx==previous:score-=7
-        if idx in (21,22) and previous in (21,22):score-=3
-        # Deterministic tie break with mild rotation.
+            if idx in (15,16):score += 4 if 3<=n<=9 and chars<650 else -4
+            elif idx==12:score += 3 if n>=4 else 1
+            elif idx==17:score += 2 if n<=4 else -2
+            elif idx in (11,14):score += 3 if chars>400 else 1
+            elif idx==9:score += 2 if chars<500 else -2
+        score -= usage.get(idx,0)*1.25
+        if idx==previous:score -= 7
         score += ((idx*7+slide_num*3)%11)*.015
         scores.append((score,idx))
     return max(scores)[1]
@@ -124,7 +123,7 @@ def populate(slide,c,src,page,idx):
 
 def run(template,source,output,report_path=None,min_pt=17):
     deck=Presentation(str(template));incoming=Presentation(str(source));originals=list(deck.slides)
-    if len(originals)<29:raise ValueError('Expected 2026 All Hands template with 29 slides')
+    if len(originals)<19:raise ValueError(f'Expected 2026 All Hands template with at least 19 slides; got {len(originals)}')
     contents=[source_content(s) for s in incoming.slides]
     report=[];usage={};previous=None;page=0
     # Guaranteed branded introduction, unless source begins with a clear introduction.
