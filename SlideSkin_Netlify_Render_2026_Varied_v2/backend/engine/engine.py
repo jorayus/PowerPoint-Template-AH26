@@ -1,161 +1,183 @@
-"""SlideSkin beta v2: diversified template-native layouts and mandatory bookends.
-Experimental: native charts/tables/media are flagged rather than silently certified.
+"""Ray's Magic PowerPoint Converter: geometry-aware deterministic beta.
+Uses native 2026 slide designs. Preserves editable text, raster images and notes.
+Reports unsupported native objects instead of claiming perfect preservation.
 """
-import io, json, math, re
+import io,json,re,math
 from pathlib import Path
 from pptx import Presentation
 from pptx.util import Pt
 from pptx.enum.shapes import MSO_SHAPE_TYPE
-from base_engine import (source_content, clone_template_slide, set_text,
-                         get_title, get_bodies, EMU)
+from base_engine import clone_template_slide,set_text,EMU
 
-COVER=8
-CLOSING=18
-TEXT_LAYOUTS=[9,11,12,14,17]
-IMAGE_LAYOUTS=[9,11,12,14]
+INTRO=8; OUTRO=18
+TEXT_CANDIDATES=(11,12,15,16)
+IMAGE_CANDIDATES=(9,11,12)
 
-def is_intro(c):
+def extract(slide):
+    shapes=[s for s in slide.shapes if s.has_text_frame and s.text.strip() and not re.fullmatch(r'\d+',s.text.strip())]
+    title_shape=slide.shapes.title
+    title=title_shape.text.strip() if title_shape is not None and title_shape.text.strip() else (shapes[0].text.strip() if shapes else 'Untitled')
+    rest=[s.text.strip() for s in shapes if s is not title_shape and s.text.strip()!=title]
+    # A paragraph of prose is not a subtitle. Keep it in the body.
+    subtitle=rest.pop(0) if rest and len(rest[0])<=110 and '\n' not in rest[0] and '\v' not in rest[0] else ''
+    lines=[line.strip().lstrip('•').strip() for block in rest for line in re.split(r'[\n\v]',block) if line.strip()]
+    return dict(title=title,subtitle=subtitle,lines=lines,images=[s for s in slide.shapes if s.shape_type==MSO_SHAPE_TYPE.PICTURE],
+       charts=sum(bool(s.has_chart) for s in slide.shapes),tables=sum(bool(s.has_table) for s in slide.shapes),
+       media=sum(s.shape_type==MSO_SHAPE_TYPE.MEDIA for s in slide.shapes))
+
+def kind(c):
     t=c['title'].lower().strip()
-    return bool(re.search(r'^(welcome|introduction|overview|title slide|opening)(\b|$)',t))
+    if re.match(r'^(thank you|thanks|questions|q\s*&\s*a|the end|closing)\b',t):return 'closing'
+    if re.match(r'^(welcome|introduction|overview|opening|title slide)\b',t):return 'intro'
+    return 'content'
 
-def is_closing(c):
-    t=c['title'].lower().strip()
-    return bool(re.search(r'^(thank you|thanks|questions|q\s*&\s*a|the end|closing)(\b|$)',t))
-
-def choose_layout(c,previous,usage,slide_num):
-    """Rank real 19-slide template candidates, penalizing repetition."""
-    imgs=len(c['images']); n=len(c['bullets']); chars=sum(map(len,c['bullets']))
-    candidates=IMAGE_LAYOUTS if imgs else TEXT_LAYOUTS
+def layout(c,usage,prev):
+    n=len(c['lines']); size=sum(map(len,c['lines']))+len(c['subtitle']); imgs=len(c['images'])
+    options=IMAGE_CANDIDATES if imgs else TEXT_CANDIDATES
     scores=[]
-    for idx in candidates:
-        score=0.0
+    for i in options:
+        # 9: left text/right visual; 11: full width; 12: two columns; 15/16: three columns
         if imgs:
-            score += {9:5,11:2,12:4,14:3}[idx]
-            if chars>450: score += {9:-3,11:2,12:0,14:1}[idx]
+            base={9:9,11:5,12:8}[i]
+            if size>440:base+= {9:-3,11:2,12:-1}[i]
+            if imgs>1:base+= {9:-2,11:1,12:2}[i]
         else:
-            if idx in (15,16):score += 4 if 3<=n<=9 and chars<650 else -4
-            elif idx==12:score += 3 if n>=4 else 1
-            elif idx==17:score += 2 if n<=4 else -2
-            elif idx in (11,14):score += 3 if chars>400 else 1
-            elif idx==9:score += 2 if chars<500 else -2
-        score -= usage.get(idx,0)*1.25
-        if idx==previous:score -= 7
-        score += ((idx*7+slide_num*3)%11)*.015
-        scores.append((score,idx))
+            base={11:7,12:6,15:5,16:5}[i]
+            if size>600:base+= {11:4,12:2,15:-5,16:-5}[i]
+            if 3<=n<=7 and size<550:base+= {11:0,12:2,15:4,16:4}[i]
+            if n<=2:base+= {11:4,12:-2,15:-4,16:-4}[i]
+        base-=min(usage.get(i,0),5)*0.7
+        if prev==i:base-=5
+        scores.append((base,i))
     return max(scores)[1]
 
-def notes_copy(src,dst):
-    try:
-        value=src.notes_slide.notes_text_frame.text
-        if value:dst.notes_slide.notes_text_frame.text=value
-    except Exception:pass
+def text_slots(slide):
+    bodies=[]; heads=[]
+    for s in slide.shapes:
+        if not s.has_text_frame:continue
+        name=s.name.lower()
+        if 'content placeholder' in name:
+            (heads if s.height<.75*EMU else bodies).append(s)
+    return sorted(heads,key=lambda s:s.left),sorted(bodies,key=lambda s:s.left)
 
-def put_image_contained(slide,src_shape,box):
+def remove_demo(slide):
+    # Clear ALL example text, including unusual text shapes in slide 17, without touching decorative graphics.
+    for s in slide.shapes:
+        if not s.has_text_frame:continue
+        n=s.name.lower()
+        if 'title' in n and 'subtitle' not in n:continue
+        if 'slide number' in n:continue
+        if s.text.strip():set_text(s,'')
+
+def fit_image(slide,im,region):
     from PIL import Image
-    data=src_shape.image.blob
-    with Image.open(io.BytesIO(data)) as img: iw,ih=img.size
-    x,y,w,h=box
+    blob=im.image.blob
+    with Image.open(io.BytesIO(blob)) as img:iw,ih=img.size
+    x,y,w,h=region
     ratio=min(w/iw,h/ih)
-    tw=int(iw*ratio);th=int(ih*ratio)
-    slide.shapes.add_picture(io.BytesIO(data),x+(w-tw)//2,y+(h-th)//2,width=tw,height=th)
+    ww=max(1,int(iw*ratio));hh=max(1,int(ih*ratio))
+    slide.shapes.add_picture(io.BytesIO(blob),x+(w-ww)//2,y+(h-hh)//2,width=ww,height=hh)
 
-def add_cover(deck,originals,title,subtitle,idx,src=None):
-    dest=clone_template_slide(deck,originals[idx-1])
-    titles=[s for s in dest.shapes if s.has_text_frame and 'title' in s.name.lower() and 'subtitle' not in s.name.lower()]
-    subs=[s for s in dest.shapes if s.has_text_frame and 'subtitle' in s.name.lower()]
-    if titles:set_text(titles[0],title)
-    if subs:set_text(subs[0],subtitle)
-    if src:notes_copy(src,dest)
-    return dest
+def fill_images(slide,images,region):
+    if not images:return
+    x,y,w,h=region
+    count=len(images);cols=1 if count==1 else 2;rows=math.ceil(count/cols);gap=int(.10*EMU)
+    cw=(w-gap*(cols-1))//cols;ch=(h-gap*(rows-1))//rows
+    for j,im in enumerate(images):fit_image(slide,im,(x+(j%cols)*(cw+gap),y+(j//cols)*(ch+gap),cw,ch))
 
-def populate(slide,c,src,page,idx):
+def distribute(lines,slots):
+    if not slots:return []
+    # Fill by estimated usable character capacity rather than equal line counts.
+    caps=[max(1,int((s.width/EMU)*(s.height/EMU)*12)) for s in slots]
+    groups=[[] for _ in slots];idx=0;used=0
+    for line in lines:
+        if idx<len(slots)-1 and used+len(line)>caps[idx] and groups[idx]:idx+=1;used=0
+        groups[idx].append(line);used+=len(line)
+    return groups
+
+def apply(slide,c,page,index,source):
     warnings=[]
-    title=get_title(slide)
+    title=next((s for s in slide.shapes if s.has_text_frame and 'title' in s.name.lower() and 'subtitle' not in s.name.lower()),None)
+    remove_demo(slide)
     if title:set_text(title,c['title'])
     for s in slide.shapes:
         if s.has_text_frame and 'slide number' in s.name.lower():set_text(s,str(page))
-    bodies=get_bodies(slide)
-    # Text placeholders are filled in-place; sample content must not survive.
-    for s in bodies:set_text(s,'')
-    payload='\n'.join(([c['subtitle']] if c['subtitle'] else [])+['• '+b for b in c['bullets']])
-    if bodies:
-        # The largest usable body is preferred, with smaller regions cleared.
-        target=max(bodies,key=lambda s:s.width*s.height)
-        if len(payload)>950:warnings.append('Dense content: inspect text overflow visually')
-        size=17 if len(payload)>650 else (18 if len(payload)>400 else 19)
-        set_text(target,payload,size)
-    elif payload:
-        from base_engine import add_text
-        add_text(slide,1.1,2.0,10.7,3.9,payload,18)
-        warnings.append('No native text placeholder; used template-derived textbox')
-    # Use template picture placeholder geometry rather than arbitrary image positions.
-    image_boxes=[]
-    for sh in list(slide.shapes):
-        if sh is title:continue
-        if ('picture placeholder' in sh.name.lower() or
-            (sh.is_placeholder and sh.placeholder_format.type==18)):
-            image_boxes.append((sh.left,sh.top,sh.width,sh.height))
-            sh._element.getparent().remove(sh._element)
+    heads,bodies=text_slots(slide)
     if c['images']:
-        if not image_boxes:
-            # For slides where picture regions exist in the layout but not slide XML.
-            image_boxes=[(int(7.45*EMU),int(1.85*EMU),int(4.65*EMU),int(4.55*EMU))]
-            if bodies:
-                target=max(bodies,key=lambda s:s.width*s.height)
-                right=image_boxes[0][0]-int(.25*EMU)
-                if target.left+target.width>right:
-                    target.width=max(int(2.5*EMU),right-target.left)
-            warnings.append('Picture region inferred; inspect placement')
-        if len(c['images'])>len(image_boxes):
-            warnings.append('Additional images arranged in primary image region')
-        x,y,w,h=image_boxes[0]
-        count=len(c['images'])
-        cols=math.ceil(math.sqrt(count));rows=math.ceil(count/cols)
-        gap=int(.09*EMU)
-        for j,img in enumerate(c['images']):
-            col=j%cols;row=j//cols
-            cellw=(w-gap*(cols-1))//cols;cellh=(h-gap*(rows-1))//rows
-            put_image_contained(slide,img,(x+col*(cellw+gap),y+row*(cellh+gap),cellw,cellh))
+        # Native template content regions are the alignment anchors.
+        if index==9:
+            region=(int(6.6*EMU),int(1.7*EMU),int(5.9*EMU),int(4.75*EMU))
+        elif index==12:
+            region=(int(6.7*EMU),int(1.9*EMU),int(5.7*EMU),int(4.3*EMU))
+            bodies=[s for s in bodies if s.left<6.5*EMU]
+            heads=[s for s in heads if s.left<6.5*EMU]
+        else:
+            region=(int(7.2*EMU),int(1.9*EMU),int(5.1*EMU),int(4.3*EMU))
+            for s in bodies:
+                if s.left+s.width>region[0]-int(.2*EMU):s.width=max(int(2.4*EMU),region[0]-int(.35*EMU)-s.left)
+            for s in heads:
+                if s.left+s.width>region[0]-int(.2*EMU):s.width=max(int(2.4*EMU),region[0]-int(.35*EMU)-s.left)
+        fill_images(slide,c['images'],region)
+    # Headings are aligned to template's native horizontal rule/heading strip at y=1.5.
+    if heads and c['subtitle']:set_text(heads[0],c['subtitle'],16)
+    elif c['subtitle']:
+        # No subhead placeholder: include subtitle in body, never float a new textbox over the rule.
+        c=dict(c,lines=[c['subtitle']]+c['lines'])
+    if index in (15,16) and not c['images'] and len(bodies)>1:
+        groups=distribute(c['lines'],bodies)
+        for j,(s,g) in enumerate(zip(bodies,groups)):
+            set_text(s,'\n'.join('• '+v for v in g),16 if sum(map(len,g))>180 else 18)
+            if j<len(heads):set_text(heads[j],c['subtitle'] if j==0 and c['subtitle'] else f'POINT {j+1}',15)
+    elif bodies:
+        target=max(bodies,key=lambda s:s.width*s.height)
+        lines=c['lines']
+        if index==12 and not c['images'] and len(bodies)>=2:
+            groups=distribute(lines,bodies)
+            for s,g in zip(bodies,groups):set_text(s,'\n'.join('• '+v for v in g),17)
+        else:
+            size=18 if sum(map(len,lines))<340 else 16
+            set_text(target,'\n'.join('• '+v for v in lines),size)
+            cap=max(1,int(target.width/EMU*target.height/EMU*12))
+            if sum(map(len,lines))>cap:warnings.append('Text may overflow; review this slide')
+    elif c['lines']:
+        warnings.append('No native text region available; content requires review')
     for key in ('charts','tables','media'):
-        if c[key]:warnings.append(f'{len(c[key])} native {key} object(s) not yet supported by fidelity-preserving export')
-    notes_copy(src,slide)
+        if c[key]:warnings.append(f'{c[key]} source {key} object(s) require manual recreation; not preserved')
+    try:
+        note=source.notes_slide.notes_text_frame.text
+        if note:slide.notes_slide.notes_text_frame.text=note
+    except Exception:pass
     return warnings
 
-def run(template,source,output,report_path=None,min_pt=17):
+def cover(deck,originals,index,title,subtitle,source=None):
+    dst=clone_template_slide(deck,originals[index-1])
+    for s in dst.shapes:
+        if not s.has_text_frame:continue
+        name=s.name.lower()
+        if 'subtitle' in name:set_text(s,subtitle)
+        elif 'title' in name:set_text(s,title)
+    if source is not None:
+        try:dst.notes_slide.notes_text_frame.text=source.notes_slide.notes_text_frame.text
+        except Exception:pass
+    return dst
+
+def run(template,source,output,report_path=None,min_pt=16):
     deck=Presentation(str(template));incoming=Presentation(str(source));originals=list(deck.slides)
-    if len(originals)<19:raise ValueError(f'Expected 2026 All Hands template with at least 19 slides; got {len(originals)}')
-    contents=[source_content(s) for s in incoming.slides]
-    report=[];usage={};previous=None;page=0
-    # Guaranteed branded introduction, unless source begins with a clear introduction.
-    intro_source=0 if contents and is_intro(contents[0]) else None
-    if intro_source is None:
-        title=contents[0]['title'] if contents else 'Presentation'
-        add_cover(deck,originals,title,'Presented with SlideSkin',COVER)
-        page+=1
-        report.append({'source_slide':None,'output_slides':[page],'template_slide':COVER,'mode':'generated_introduction','warnings':[]})
-    for i,(src,c) in enumerate(zip(incoming.slides,contents)):
-        if i==0 and is_intro(c):
-            page+=1;add_cover(deck,originals,c['title'],c['subtitle'],COVER,src)
-            report.append({'source_slide':i+1,'output_slides':[page],'template_slide':COVER,'mode':'source_introduction','warnings':[]})
-            continue
-        if i==len(contents)-1 and is_closing(c):
-            # Do not discard any content from a closing slide: it can have images/body.
-            if c['images'] or c['bullets']:
-                idx=choose_layout(c,previous,usage,i)
-                page+=1;dst=clone_template_slide(deck,originals[idx-1]);warnings=populate(dst,c,src,page,idx)
-                report.append({'source_slide':i+1,'output_slides':[page],'template_slide':idx,'mode':'source_closing_content','warnings':warnings})
-            else:
-                page+=1;add_cover(deck,originals,c['title'],c['subtitle'],CLOSING,src)
-                report.append({'source_slide':i+1,'output_slides':[page],'template_slide':CLOSING,'mode':'source_closing','warnings':[]})
-            continue
-        idx=choose_layout(c,previous,usage,i)
-        usage[idx]=usage.get(idx,0)+1;previous=idx
-        page+=1;dst=clone_template_slide(deck,originals[idx-1]);warnings=populate(dst,c,src,page,idx)
-        report.append({'source_slide':i+1,'output_slides':[page],'template_slide':idx,'mode':'content_matched','warnings':warnings})
-    # Always finish with a branded closing, unless a simple native closing already exists.
-    if not(contents and is_closing(contents[-1]) and not contents[-1]['images'] and not contents[-1]['bullets']):
-        page+=1;add_cover(deck,originals,'Thank You!','Questions?',CLOSING)
-        report.append({'source_slide':None,'output_slides':[page],'template_slide':CLOSING,'mode':'generated_closing','warnings':[]})
+    if len(originals)<19:raise ValueError(f'The 2026 template requires the 19-slide reference deck; found {len(originals)}')
+    contents=[extract(s) for s in incoming.slides]
+    report=[];usage={};prev=None;page=0
+    # Always create explicit bookends. Existing source opening/closing content is retained too.
+    intro=contents[0]['title'] if contents else 'Presentation'
+    cover(deck,originals,INTRO,intro,'Ray\'s Magic PowerPoint Converter')
+    page+=1;report.append(dict(source_slide=None,output_slides=[page],template_slide=INTRO,mode='generated_introduction',warnings=[]))
+    for i,(src,c) in enumerate(zip(incoming.slides,contents),1):
+        idx=layout(c,usage,prev)
+        usage[idx]=usage.get(idx,0)+1;prev=idx
+        dst=clone_template_slide(deck,originals[idx-1]);page+=1
+        warnings=apply(dst,c,page,idx,src)
+        report.append(dict(source_slide=i,output_slides=[page],template_slide=idx,mode='content_matched',warnings=warnings))
+    cover(deck,originals,OUTRO,'Thank You!','Questions?')
+    page+=1;report.append(dict(source_slide=None,output_slides=[page],template_slide=OUTRO,mode='generated_closing',warnings=[]))
     for _ in originals:
         sid=deck.slides._sldIdLst[0];deck.part.drop_rel(sid.rId);deck.slides._sldIdLst.remove(sid)
     deck.save(str(output))
