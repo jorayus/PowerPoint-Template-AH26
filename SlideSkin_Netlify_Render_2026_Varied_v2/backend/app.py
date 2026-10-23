@@ -13,7 +13,7 @@ MAX_MB=int(os.environ.get('MAX_UPLOAD_MB','20'))
 TTL=900
 results={}
 lock=threading.Lock()
-app=FastAPI(title='SlideSkin API',version='0.1-beta')
+app=FastAPI(title="Ray's Magic PowerPoint Converter API",version='0.1-beta')
 origins=[v.strip().rstrip('/') for v in os.environ.get('FRONTEND_ORIGINS','http://localhost:8888,http://127.0.0.1:8888').split(',') if v.strip()]
 app.add_middleware(CORSMiddleware,allow_origins=origins,allow_credentials=False,allow_methods=['GET','POST'],allow_headers=['*'])
 @app.get('/api/health')
@@ -49,5 +49,5 @@ def download(job_id:str,kind:str):
     result=results.get(job_id)
     if not result or result['created']+TTL<time.time():raise HTTPException(404,'Download expired. Please run again.')
     data=result['pptx' if kind=='pptx' else 'report']
-    filename='SlideSkin_2026_Redesigned.pptx' if kind=='pptx' else 'SlideSkin_Report.json'
+    filename='Rays_Magic_PowerPoint_Converted.pptx' if kind=='pptx' else 'Rays_Magic_Conversion_Report.json'
     return Response(data,media_type='application/vnd.openxmlformats-officedocument.presentationml.presentation' if kind=='pptx' else 'application/json',headers={'Content-Disposition':f'attachment; filename="{filename}"','Cache-Control':'no-store'})
